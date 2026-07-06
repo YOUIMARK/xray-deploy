@@ -381,8 +381,8 @@ _xray_test_config() {
     [ -x "$XRAY_BIN" ] || return 1
     # 低内存机器: xray -test 加载完整二进制+geo,预先释放页缓存
     _maybe_drop_caches
-    # 子shell 抑制 bash 的 "Killed" 信号噪音(OOM 场景)
-    ( XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE" ) >/dev/null 2>&1
+    # {} group redirect: 同进程内 fd2 已重定向, bash 的 "Killed" 信号消息同样进 /dev/null
+    { XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" -test -config "$CONFIG_FILE"; } >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
