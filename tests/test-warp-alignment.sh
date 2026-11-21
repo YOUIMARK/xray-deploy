@@ -1098,6 +1098,25 @@ SH
     )
     check 'masque menu: register/TUN/delete only, no endpoint edit or WARP rules' warp_menu_surface
 
+    masque_menu_account_labels() (
+        local spec state_account expected_label
+        local masque_endpoint='198.51.100.10:443'
+        _warp_state_summary() { printf '1\tmasque\t%s\t172.16.0.2/32\t-\n' "$masque_endpoint"; }
+        for spec in \
+            'free Free' \
+            'plus Plus' \
+            'team Team'; do
+            read -r state_account expected_label <<< "$spec"
+            _warp_device_record "$WARP_DEVICE_STATE_KEY" test-device test-token "$state_account" || return 1
+            printf '0\n' | _warp_menu > "$TMP/warp-menu-account.out" 2>&1 || return 1
+            grep -Fq "MASQUE (HTTP/2|$expected_label)" "$TMP/warp-menu-account.out" || return 1
+        done
+        _warp_device_drop "$WARP_DEVICE_STATE_KEY" || return 1
+        printf '0\n' | _warp_menu > "$TMP/warp-menu-account.out" 2>&1 || return 1
+        grep -Fq 'MASQUE (HTTP/2|未知)' "$TMP/warp-menu-account.out"
+    )
+    check 'masque menu: account label comes from saved state, not endpoint IP' masque_menu_account_labels
+
     masque_tun_rejected() (
         base_cfg | cfg_reset || return 1
         local norm

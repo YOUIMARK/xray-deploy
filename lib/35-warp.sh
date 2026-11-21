@@ -564,6 +564,18 @@ _warp_device_fields() {   # <key> -> "id<TAB>token"
     printf '%s\t%s\n' "$id" "$token"
 }
 
+_warp_device_account() {   # <key> -> free|plus|team
+    local key="${1:-}" json account
+    json=$(_state_get "$key" 2>/dev/null) || return 1
+    [ -n "$json" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    account=$(printf '%s' "$json" | jq -r '.account // empty' 2>/dev/null) || return 1
+    case "$account" in
+        free|plus|team) printf '%s\n' "$account" ;;
+        *) return 1 ;;
+    esac
+}
+
 _warp_device_drop() {   # <key>
     local key="${1:-}"
     [ -n "$key" ] || return 1
@@ -1158,7 +1170,8 @@ _warp_delete() {
 }
 
 # ---------------------------------------------------------------------------
-# 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。菜单只显示是否存在/endpoint/地址/MTU。
+# 子菜单: 不调用 _menu_require_tty(只有主菜单调用)。
+# MASQUE 账号类型读注册时保存的设备状态, 不按可手动修改的 endpoint 推断。
 # ---------------------------------------------------------------------------
 _warp_ask_account() {   # sets _WARP_ACCOUNT / _WARP_SECRET; 0=ok 1=cancel
     local ans secret
@@ -1351,7 +1364,7 @@ _warp_set_tun_prompt() {
 }
 
 _warp_menu() {
-    local choice st present kind endpoint addresses mtu method
+    local choice st present kind endpoint addresses mtu method account
     while true; do
         clear
         echo
@@ -1366,7 +1379,13 @@ _warp_menu() {
             IFS=$'\t' read -r present kind endpoint addresses mtu <<< "$st"
             if [ "$present" = "1" ]; then
                 if [ "$kind" = "masque" ]; then
-                    method="MASQUE (HTTP/2)"
+                    case "$(_warp_device_account "$WARP_DEVICE_STATE_KEY" 2>/dev/null)" in
+                        free) account="Free" ;;
+                        plus) account="Plus" ;;
+                        team) account="Team" ;;
+                        *)    account="未知" ;;
+                    esac
+                    method="MASQUE (HTTP/2|${account})"
                 else
                     method="WireGuard"
                 fi
