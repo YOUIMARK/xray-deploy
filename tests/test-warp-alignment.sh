@@ -639,14 +639,41 @@ SH
     )
     check 'fetch masque: Zero Trust unwraps result and sends JWT without license binding' fetch_masque_team
 
-    masque_account_endpoints() {
+    masque_account_endpoints() (
+        ip() {
+            case "$*" in
+                "route show default") printf 'default via 192.0.2.1 dev eth0\n' ;;
+                "-6 route show default") return 0 ;;
+            esac
+        }
         [ "$(_warp_normalize_masque "$FX/masque-raw.json" plus | jq -r .server)" = "162.159.199.2" ] &&
             [ "$(_warp_normalize_masque "$FX/masque-raw.json" team | jq -r .server)" = "162.159.197.2" ] &&
             [ "$(_warp_normalize_masque "$FX/masque-raw.json" | jq -r .server)" = "162.159.198.2" ]
-    }
+    )
     check 'normalize masque: free/WARP+/Zero Trust use their own endpoints' masque_account_endpoints
 
+    masque_ipv6_endpoints() (
+        ip() {
+            case "$*" in
+                "route show default") return 0 ;;
+                "-6 route show default") printf 'default via fe80::1 dev eth0\n' ;;
+            esac
+        }
+        [ "$(_warp_normalize_masque "$FX/masque-raw.json" plus | jq -r .server)" = "2606:4700:104::2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" team | jq -r .server)" = "2606:4700:102::2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" | jq -r .server)" = "2606:4700:103::2" ] &&
+            [ "$(_warp_normalize_masque "$FX/masque-raw.json" |
+                _warp_build_outbound | jq -r .settings.address)" = "2606:4700:103::2" ]
+    )
+    check 'normalize masque: IPv6-only host switches all endpoints to IPv6' masque_ipv6_endpoints
+
     obtain_masque_plus() (
+        ip() {
+            case "$*" in
+                "route show default") printf 'default via 192.0.2.1 dev eth0\n' ;;
+                "-6 route show default") return 0 ;;
+            esac
+        }
         _warp_fetch_masque() { cp "$FX/masque-raw.json" "$1"; }
         rm -f "$TMP/masque-plus-obtain.json"
         _warp_obtain "$TMP/masque-plus-obtain.json" masque plus \
@@ -891,7 +918,7 @@ SH
     # B2. Cloudflare 设备生命周期: 记录/释放/提交/回滚
     # -----------------------------------------------------------------------
     device_record_roundtrip() (
-        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         _warp_device_record "$WARP_DEVICE_PENDING_KEY" t.a849f2f4-61dd-11ed-8b7d-3acbb31d7d51 TOKEN1 team || return 1
         [ "$(_warp_device_fields "$WARP_DEVICE_PENDING_KEY")" = "$(printf 't.a849f2f4-61dd-11ed-8b7d-3acbb31d7d51\tTOKEN1')" ] || return 1
         [ "$(stat -c %a "$STATE_DIR/$WARP_DEVICE_PENDING_KEY")" = 600 ] || return 1
@@ -935,7 +962,7 @@ SH
     check 'device: release keeps the record on failure and treats 404 as gone' device_release_failure_keeps_state
 
     device_rollback_releases_team_pending() (
-        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         : > "$TMP/device-curl.log"
         curl() {
             printf '%s\n' "$*" >> "$TMP/device-curl.log"
@@ -948,8 +975,22 @@ SH
     )
     check 'device: rollback releases team-style pending device' device_rollback_releases_team_pending
 
+    device_rollback_failure_queues_pending() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
+        curl() { printf '%s' 500; }
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" PEND_FAIL PENDTOK plus || return 1
+        _warp_device_rollback || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ] || return 1
+        jq -e '.[0].id == "PEND_FAIL" and .[0].token == "PENDTOK"' \
+            "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY" >/dev/null 2>&1 || return 1
+        curl() { printf '%s' 204; }
+        _warp_device_retired_release || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY" ]
+    )
+    check 'device: failed rollback keeps the pending device in the retry list' device_rollback_failure_queues_pending
+
     device_commit_releases_old() (
-        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         : > "$TMP/device-curl.log"
         curl() {
             printf '%s\n' "$*" >> "$TMP/device-curl.log"
@@ -964,9 +1005,26 @@ SH
     )
     check 'device: commit releases the old team device and promotes the new one' device_commit_releases_old
 
+    device_commit_failure_queues_old() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
+        curl() { printf '%s' 500; }
+        _warp_device_record "$WARP_DEVICE_STATE_KEY" OLD_FAIL OLDTOK plus || return 1
+        _warp_device_record "$WARP_DEVICE_PENDING_KEY" NEW_OK NEWTOK plus || return 1
+        _warp_device_commit || return 1
+        [ "$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" | cut -f1)" = NEW_OK ] || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" ] || return 1
+        jq -e '.[0].id == "OLD_FAIL" and .[0].token == "OLDTOK"' \
+            "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY" >/dev/null 2>&1 || return 1
+        [ "$(stat -c %a "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY")" = 600 ] || return 1
+        curl() { printf '%s' 204; }
+        _warp_device_retired_release || return 1
+        [ ! -e "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY" ]
+    )
+    check 'device: failed old-device release keeps it for a later retry' device_commit_failure_queues_old
+
     license_bind_errors_preserve_current_device() (
         local dir
-        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         _warp_device_record "$WARP_DEVICE_STATE_KEY" OLDDEV OLDTOK plus || return 1
         _warp_device_release_fields() {
             : > "$TMP/license-bind-released"
@@ -1008,7 +1066,7 @@ SH
     check 'license bind: rate limit and device quota failures keep the current device' license_bind_errors_preserve_current_device
 
     register_failure_releases_pending() (
-        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         base_cfg | cfg_reset || return 1
         : > "$TMP/device-curl.log"
         curl() {
@@ -1031,7 +1089,7 @@ SH
     # C. 出站生命周期
     # -----------------------------------------------------------------------
     printf '== C. outbound lifecycle ==\n'
-    rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY"
+    rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
     base_cfg | cfg_reset || exit 1
     check 'apply: writes the warp outbound after the existing ones' _warp_apply "$(norm_a)"
     check 'apply: outbound order is direct, block, warp' eq 'direct|block|warp' "$(_config_jq -r '.outbounds | map(.tag) | join("|")')"
@@ -1089,6 +1147,7 @@ SH
     check 'masque state summary: reports method/endpoint/address without secrets' masque_state_summary
 
     warp_menu_surface() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
         _warp_state_summary() { printf '1\tmasque\t162.159.198.2:443\t172.16.0.2/32\t-\n'; }
         printf '0\n' | _warp_menu > "$TMP/warp-menu.out" 2>&1 || return 1
         grep -q '\[1\].*注册' "$TMP/warp-menu.out" &&
@@ -1097,6 +1156,17 @@ SH
             ! grep -q '修改 endpoint\|分流规则\|\[4\]\|\[5\]\|\[6\]\|\[7\]' "$TMP/warp-menu.out"
     )
     check 'masque menu: register/TUN/delete only, no endpoint edit or WARP rules' warp_menu_surface
+
+    warp_menu_retry_surface() (
+        rm -f -- "$STATE_DIR/$WARP_DEVICE_STATE_KEY" "$STATE_DIR/$WARP_DEVICE_PENDING_KEY" "$STATE_DIR/$WARP_DEVICE_RETIRED_KEY"
+        _warp_state_summary() { printf '0\t-\t-\t-\t-\n'; }
+        _warp_device_retire_json '{"id":"STALE_DEVICE","token":"STALE_TOKEN","account":"plus"}' || return 1
+        printf '0\n' | _warp_menu > "$TMP/warp-menu-retired.out" 2>&1 || return 1
+        grep -Fq '待清理:' "$TMP/warp-menu-retired.out" &&
+            grep -q '\[4\].*重试释放待清理的 WARP 设备' "$TMP/warp-menu-retired.out" &&
+            _warp_device_drop "$WARP_DEVICE_RETIRED_KEY"
+    )
+    check 'masque menu: pending device release exposes a retry action' warp_menu_retry_surface
 
     masque_menu_account_labels() (
         local spec state_account expected_label

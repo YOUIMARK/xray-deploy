@@ -15,6 +15,9 @@ WARP_API_BASE="https://api.cloudflareclient.com/v0a4471"
 WARP_MASQUE_ENDPOINT="162.159.198.2"
 WARP_MASQUE_ENDPOINT_PLUS="162.159.199.2"
 WARP_MASQUE_ENDPOINT_TEAM="162.159.197.2"
+WARP_MASQUE_ENDPOINT6="2606:4700:103::2"
+WARP_MASQUE_ENDPOINT6_PLUS="2606:4700:104::2"
+WARP_MASQUE_ENDPOINT6_TEAM="2606:4700:102::2"
 WARP_MASQUE_PORT="443"
 # usque README 推荐使用 zt-masque; consumer-masque 虽可用但在部分网络会被重置。
 WARP_MASQUE_SERVER_NAME="zt-masque.cloudflareclient.com"
@@ -23,6 +26,7 @@ _WARP_HTTP_CODE=""
 # Cloudflare 设备记录: 重新注册/删除 WARP 时据此释放旧设备, 否则 WARP+ 5 台额度会被占满。
 WARP_DEVICE_STATE_KEY="warp_device"
 WARP_DEVICE_PENDING_KEY="warp_device_pending"
+WARP_DEVICE_RETIRED_KEY="warp_device_retired"
 
 # 归一/生成共用的 jq 定义: 内部表示字段名与类型固定, 缺必填字段或非法 reserved 一律 error 退出。
 # reserved 按官方文档是可选项(默认全 0), 省略时补 [0,0,0]; mtu 缺省取 1280 是 Cloudflare WARP 的
@@ -193,12 +197,24 @@ _warp_endpoint_norm() {
 }
 
 # 账号类型对应的 MASQUE 端点; WireGuard 使用注册响应里的 endpoint。
+# MASQUE 的 settings.address 是 IP, 不能交给 Xray 解析域名, 因此与 WireGuard 的
+# domainStrategy 一样按默认路由选择地址族, 让 IPv6-only 主机也能连上 anycast。
 _warp_masque_endpoint() {   # [free|plus|team]
-    case "${1:-free}" in
-        plus) printf '%s' "$WARP_MASQUE_ENDPOINT_PLUS" ;;
-        team) printf '%s' "$WARP_MASQUE_ENDPOINT_TEAM" ;;
-        *) printf '%s' "$WARP_MASQUE_ENDPOINT" ;;
-    esac
+    local endpoint
+    if [ "$(_warp_domain_strategy)" = "UseIPv6" ]; then
+        case "${1:-free}" in
+            plus) endpoint="$WARP_MASQUE_ENDPOINT6_PLUS" ;;
+            team) endpoint="$WARP_MASQUE_ENDPOINT6_TEAM" ;;
+            *) endpoint="$WARP_MASQUE_ENDPOINT6" ;;
+        esac
+    else
+        case "${1:-free}" in
+            plus) endpoint="$WARP_MASQUE_ENDPOINT_PLUS" ;;
+            team) endpoint="$WARP_MASQUE_ENDPOINT_TEAM" ;;
+            *) endpoint="$WARP_MASQUE_ENDPOINT" ;;
+        esac
+    fi
+    printf '%s' "$endpoint"
 }
 
 _warp_account_label() {   # [free|plus|team]
@@ -604,24 +620,124 @@ _warp_device_release() {   # <key>
     _warp_device_drop "$key"
 }
 
-# 新设备已生效: 待确认记录提升为当前设备, 再释放上一台设备(释放 WARP+ 额度)。
+# 解绑失败的设备进入独立列表, 保留 id/token 供菜单或下次操作重试。
+_warp_device_retired_count() {
+    local json count
+    json=$(_state_get "$WARP_DEVICE_RETIRED_KEY" 2>/dev/null) || json=""
+    [ -n "$json" ] || { printf '0\n'; return 0; }
+    command -v jq >/dev/null 2>&1 || { printf '0\n'; return 1; }
+    count=$(printf '%s' "$json" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null) || count=0
+    printf '%s\n' "$count"
+}
+
+_warp_device_retire_json() {   # <record-json>
+    local record="${1:-}" dir rc=1
+    [ -n "$record" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-retire.XXXXXX") || return 1
+    chmod 700 "$dir" 2>/dev/null || { rm -rf -- "$dir"; return 1; }
+    if printf '%s' "$record" > "$dir/record.json" &&
+        { _state_get "$WARP_DEVICE_RETIRED_KEY" > "$dir/list.json" 2>/dev/null || printf '[]' > "$dir/list.json"; } &&
+        [ -s "$dir/list.json" ] &&
+        jq -cs '
+            (.[0] // []) as $old
+            | (.[1] // {}) as $new
+            | if ($old | type) != "array" then
+                error("retired state is not an array")
+              elif (($new.id // "") | test("^[A-Za-z0-9_.-]+$") | not)
+                or (($new.token // "") == "") then
+                error("invalid device record")
+              else
+                ($old + [{id: $new.id, token: $new.token, account: ($new.account // "free")}])
+                | unique_by(.id)
+              end
+        ' "$dir/list.json" "$dir/record.json" > "$dir/next.json"; then
+        _state_set "$WARP_DEVICE_RETIRED_KEY" "$(cat "$dir/next.json")" && rc=0
+    fi
+    rm -rf -- "$dir"
+    [ "$rc" -eq 0 ]
+}
+
+_warp_device_retire_key() {   # <key>
+    local key="${1:-}" record
+    record=$(_state_get "$key" 2>/dev/null) || return 1
+    _warp_device_retire_json "$record" || return 1
+    _warp_device_drop "$key"
+}
+
+_warp_device_retired_release() {
+    local dir rc=0 id token
+    if ! _state_get "$WARP_DEVICE_RETIRED_KEY" >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v jq >/dev/null 2>&1 || return 1
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/warp-retired-release.XXXXXX") || return 1
+    chmod 700 "$dir" 2>/dev/null || { rm -rf -- "$dir"; return 1; }
+    _state_get "$WARP_DEVICE_RETIRED_KEY" > "$dir/list.json" 2>/dev/null || rc=1
+    if [ "$rc" -eq 0 ] &&
+        jq -e 'type == "array"' "$dir/list.json" >/dev/null 2>&1 &&
+        jq -r '.[] | [(.id // ""), (.token // "")] | @tsv' "$dir/list.json" > "$dir/records.tsv" 2>/dev/null; then
+        while IFS=$'\t' read -r id token; do
+            if [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] && [ -n "$token" ] &&
+                _warp_device_release_fields "$id" "$token"; then
+                if ! jq -c --arg id "$id" 'map(select(.id != $id))' "$dir/list.json" > "$dir/next.json" ||
+                    ! mv -f "$dir/next.json" "$dir/list.json"; then
+                    rc=1
+                    break
+                fi
+            else
+                rc=1
+            fi
+        done < "$dir/records.tsv"
+        if jq -e 'length == 0' "$dir/list.json" >/dev/null 2>&1; then
+            _warp_device_drop "$WARP_DEVICE_RETIRED_KEY" || rc=1
+        else
+            _state_set "$WARP_DEVICE_RETIRED_KEY" "$(cat "$dir/list.json")" || rc=1
+        fi
+    else
+        rc=1
+    fi
+    rm -rf -- "$dir"
+    [ "$rc" -eq 0 ]
+}
+
+_warp_device_release_or_retire() {   # <key>
+    local key="${1:-}"
+    _warp_device_fields "$key" >/dev/null 2>&1 || return 0
+    _warp_device_release "$key" && return 0
+    _warp_device_retire_key "$key"
+}
+
+# 新设备已生效: 待确认记录提升为当前设备, 上一台设备先转入待释放列表再解绑。
 _warp_device_commit() {
-    local pending old old_id old_token
+    local pending old pending_id old_id
     pending=$(_state_get "$WARP_DEVICE_PENDING_KEY" 2>/dev/null) || pending=""
     [ -n "$pending" ] || return 0
-    old=$(_warp_device_fields "$WARP_DEVICE_STATE_KEY" 2>/dev/null) || old=""
-    if ! _state_set "$WARP_DEVICE_STATE_KEY" "$pending"; then
-        # 记录失败时清掉 pending, 避免之后误删仍在使用的设备。
-        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
-        _warn "WARP 设备记录写入失败, 之后无法自动释放设备额度"
+    pending_id=$(printf '%s' "$pending" | jq -r '.id // empty' 2>/dev/null) || pending_id=""
+    if ! [[ "$pending_id" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        _warn "待确认的 WARP 设备记录无法解析"
         return 1
     fi
-    _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
+    old=$(_state_get "$WARP_DEVICE_STATE_KEY" 2>/dev/null) || old=""
     if [ -n "$old" ]; then
-        IFS=$'\t' read -r old_id old_token <<< "$old"
-        if ! _warp_device_release_fields "$old_id" "$old_token"; then
-            _warn "旧 WARP 设备解绑失败, WARP+ 设备额度可能仍被占用"
+        old_id=$(printf '%s' "$old" | jq -r '.id // empty' 2>/dev/null) || old_id=""
+        if ! [[ "$old_id" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            _warn "现用 WARP 设备记录无法解析, 暂不覆盖"
+            return 1
         fi
+        if [ "$old_id" != "$pending_id" ] && ! _warp_device_retire_json "$old"; then
+            _warn "旧 WARP 设备记录无法保存, 暂不提升新设备"
+            return 1
+        fi
+    fi
+    if ! _state_set "$WARP_DEVICE_STATE_KEY" "$pending"; then
+        _warn "WARP 设备记录写入失败, 新设备信息仍保留在待确认记录中"
+        return 1
+    fi
+    _warp_device_drop "$WARP_DEVICE_PENDING_KEY" ||
+        _warn "WARP 待确认设备记录清理失败"
+    if ! _warp_device_retired_release; then
+        _warn "旧 WARP 设备解绑失败, 可在 WARP 菜单重试"
     fi
     return 0
 }
@@ -630,8 +746,11 @@ _warp_device_commit() {
 _warp_device_rollback() {
     _warp_device_fields "$WARP_DEVICE_PENDING_KEY" >/dev/null 2>&1 || return 0
     if ! _warp_device_release "$WARP_DEVICE_PENDING_KEY"; then
-        _warp_device_drop "$WARP_DEVICE_PENDING_KEY"
-        _warn "失败注册产生的 WARP 设备未能解绑, 额度可能被占用"
+        if _warp_device_retire_key "$WARP_DEVICE_PENDING_KEY"; then
+            _warn "失败注册产生的 WARP 设备未能解绑, 已保留待重试"
+        else
+            _warn "失败注册产生的 WARP 设备未能解绑, 额度可能被占用"
+        fi
     fi
     return 0
 }
@@ -1151,6 +1270,7 @@ _warp_apply() {
 
 # 出站与引用它的分流规则必须在同一次 jq 变更里一起删除, 否则会留下悬空 outboundTag。
 _warp_delete() {
+    local rc=0
     _config_edit_preflight "管理 WARP" || return 1
     _mutate_config '
         . as $root
@@ -1161,10 +1281,12 @@ _warp_delete() {
            then .routing.rules = ([$root.routing.rules[]? | select((.outboundTag? // "") != "warp")])
            else . end)
     ' || return 1
-    # 本地删除后再释放 Cloudflare 设备(解绑 WARP+ 额度); 失败只提示, 不影响本地清理。
-    if _warp_device_fields "$WARP_DEVICE_STATE_KEY" >/dev/null 2>&1; then
-        _warp_device_release "$WARP_DEVICE_STATE_KEY" ||
-            _warn "WARP 设备解绑失败, WARP+ 设备额度需手动释放"
+    # 本地删除后再释放 Cloudflare 设备(解绑 WARP+ 额度); 失败转入待清理列表, 不影响本地清理。
+    _warp_device_release_or_retire "$WARP_DEVICE_STATE_KEY" || rc=1
+    _warp_device_release_or_retire "$WARP_DEVICE_PENDING_KEY" || rc=1
+    _warp_device_retired_release || rc=1
+    if [ "$rc" -ne 0 ]; then
+        _warn "部分 WARP 设备解绑失败, 已保留记录, 可在 WARP 菜单重试"
     fi
     return 0
 }
@@ -1220,6 +1342,12 @@ _warp_ask_account() {   # sets _WARP_ACCOUNT / _WARP_SECRET; 0=ok 1=cancel
 
 _warp_register() {   # [wireguard|masque]
     local kind="${1:-}" ans tmp norm account secret label
+    if _warp_device_fields "$WARP_DEVICE_PENDING_KEY" >/dev/null 2>&1; then
+        if ! _warp_device_commit; then
+            _error "上次 WARP 设备记录未完成, 未重新注册"
+            return 1
+        fi
+    fi
     if [ -z "$kind" ]; then
         echo
         echo -e "  ${CYAN}选择 WARP 连接方式${NC}"
@@ -1258,7 +1386,10 @@ _warp_register() {   # [wireguard|masque]
         _error "WARP 出站写入失败(配置已回滚)"
         return 1
     fi
-    _warp_device_commit || true
+    if ! _warp_device_commit; then
+        _warn "WARP 出站已生效, 但设备状态未完整记录; 下次注册时会重试"
+        return 1
+    fi
     if [ "$kind" = "masque" ]; then
         _success "WARP MASQUE 出站已写入(tag=warp, 账号: $label), xray 已用新配置重启"
     else
@@ -1364,7 +1495,7 @@ _warp_set_tun_prompt() {
 }
 
 _warp_menu() {
-    local choice st present kind endpoint addresses mtu method account
+    local choice st present kind endpoint addresses mtu method account retired
     while true; do
         clear
         echo
@@ -1410,10 +1541,18 @@ _warp_menu() {
         else
             _warn "无法读取当前配置(Xray 未安装 / 配置缺失 / jq 不可用)"
         fi
+        retired=$(_warp_device_retired_count 2>/dev/null) || retired=0
+        case "$retired" in ''|*[!0-9]*) retired=0 ;; esac
+        if [ "$retired" -gt 0 ]; then
+            echo -e "  待清理:    ${YELLOW}${retired} 台旧 WARP 设备${NC}"
+        fi
         echo
         echo -e "  ${GREEN}[1]${NC} 注册 / 重新注册 WARP (WireGuard / MASQUE)"
         echo -e "  ${GREEN}[2]${NC} 内核 TUN 模式 (仅 WireGuard)"
         echo -e "  ${GREEN}[3]${NC} 删除 WARP 出站"
+        if [ "$retired" -gt 0 ]; then
+            echo -e "  ${GREEN}[4]${NC} 重试释放待清理的 WARP 设备"
+        fi
         echo -e "  ${GREEN}[0]${NC} 返回"
         echo
         read -rp "  请选择: " choice || return 0
@@ -1422,6 +1561,19 @@ _warp_menu() {
             1) _warp_register; _press_any_key ;;
             2) _warp_set_tun_prompt; _press_any_key ;;
             3) _warp_delete_prompt; _press_any_key ;;
+            4)
+                if [ "$retired" -gt 0 ]; then
+                    if _warp_device_retired_release; then
+                        _success "待清理的 WARP 设备已全部解绑"
+                    else
+                        _warn "仍有 WARP 设备未能解绑, 请稍后重试"
+                    fi
+                    _press_any_key
+                else
+                    _warn "无效选择"
+                    _press_any_key
+                fi
+                ;;
             *) _warn "无效选择"; _press_any_key ;;
         esac
     done
