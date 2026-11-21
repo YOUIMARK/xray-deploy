@@ -393,7 +393,58 @@ route_inbound_shadow_ips() (
 setup_case route-shadow-ips
 check 'dual-stack sourceIP/localIP hide block fallbacks, IPv4-only does not' route_inbound_shadow_ips
 
+# 精简路由时同一事务下调连接缓冲; 已有更小值不得被抬高。
+route_slim_buffer() (
+    mkdir -p "$BIN_DIR"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod +x "$XRAY_BIN"
+    _with_config_lock() { "$@"; }
+    _txn_allow_config_write() { return 0; }
+    _backup_config() { return 0; }
+    _restart_xray_verified() { return 0; }
+    uname() { printf 'x86_64\n'; }
+
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        inbounds:[{tag:"node-a"}],
+        routing:{domainStrategy:"IPIfNonMatch",rules:[
+            {inboundTag:["node-a"],outboundTag:"direct"},
+            {domain:["geosite:private"],outboundTag:"block"},
+            {ip:["geoip:cn"],outboundTag:"block"}
+        ]}}')" || return 1
+    _route_slim_geo_rules || return 1
+    _config_jq -e --argjson low "$XRAY_LOWMEM_BUFFER_KB" --arg tag "$XRAY_PRIVATE_BLOCK_RULE_TAG" '
+        (.policy.levels["0"].bufferSize == $low)
+        and (([.routing.rules[] | select((.ruleTag? // "") == $tag)] | length) == 1)
+        and (([.routing.rules[] | select(.domain? != null or .ip? != null)] | length) == 1)
+        and (([.routing.rules[] | select(.inboundTag? != null)] | length) == 1)' >/dev/null || return 1
+
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        policy:{levels:{"0":{bufferSize:64}}},
+        routing:{domainStrategy:"IPIfNonMatch",rules:[
+            {domain:["geosite:private"],outboundTag:"block"}
+        ]}}')" || return 1
+    _route_buffer_kb() { printf '512'; }
+    _route_slim_geo_rules || return 1
+    _config_jq -e '.policy.levels["0"].bufferSize == 64' >/dev/null
+
+    # ARM64 默认 4KB, 低于目标值, 不能被精简流程反向抬高。
+    uname() { printf 'aarch64\n'; }
+    [ "$(_route_buffer_default_kb)" = 4 ] || return 1
+    _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" '{
+        version:{min:$v,max:""},
+        routing:{domainStrategy:"IPIfNonMatch",rules:[
+            {domain:["geosite:private"],outboundTag:"block"}
+        ]}}')" || return 1
+    _route_slim_geo_rules || return 1
+    _config_jq -e '(.policy? // null) == null' >/dev/null
+)
+setup_case route-slim-buffer
+check 'slim routing adjusts the per-connection buffer' route_slim_buffer
+
 # 恢复默认保留节点规则; 带用户标记的 inboundTag 规则属于自定义规则, 必须一并丢弃。
+# 小内存缓冲 256KB 属于脚本注入值, 恢复时应清掉; 同层其它 policy 字段保留。
 route_restore_defaults() (
     mkdir -p "$BIN_DIR"
     printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
@@ -401,6 +452,7 @@ route_restore_defaults() (
     _config_write_merged "$(jq -nc --arg v "$XRAY_CORE_MIN_VERSION" --arg u "$ROUTE_USER_RULE_TAG" '{
         version:{min:$v,max:""},
         inbounds:[{tag:"node-a"}],
+        policy:{levels:{"0":{bufferSize:256,connIdle:300}}},
         routing:{domainStrategy:"AsIs",rules:[
             {inboundTag:["node-a"],outboundTag:"direct"},
             {inboundTag:["node-a"],outboundTag:"block",ruleTag:$u},
@@ -415,7 +467,9 @@ route_restore_defaults() (
         (.routing.domainStrategy == "IPIfNonMatch")
         and (([.routing.rules[] | select(.inboundTag? != null)] | length) == 1)
         and (([.routing.rules[] | select((.ruleTag? // "") == $u)] | length) == 0)
-        and ((.routing.rules | length) == (1 + $n))' >/dev/null
+        and ((.routing.rules | length) == (1 + $n))
+        and (.policy.levels["0"].bufferSize == null)
+        and (.policy.levels["0"].connIdle == 300)' >/dev/null
 )
 setup_case route-restore
 check 'restore defaults drops user inbound rules and keeps node rules' route_restore_defaults

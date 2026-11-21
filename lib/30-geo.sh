@@ -384,14 +384,49 @@ _route_dns_geo_count() {
     return 0
 }
 
+# Xray 各架构的默认缓冲(KB): 32 位 ARM/MIPS 为 0, ARM64/MIPS64 为 4, 其它为 512。
+# 与 features/policy/policy.go 的 readDefaultBufferSize 对齐; 只用于判断是否还需要下调。
+_route_buffer_default_kb() {
+    case "$(uname -m 2>/dev/null)" in
+        arm64|aarch64|mips64|mips64el|mips64le) printf '4' ;;
+        arm*|mips|mipsle) printf '0' ;;
+        *) printf '512' ;;
+    esac
+}
+
+# 当前每连接内部缓冲(KB); 未配置时按当前架构默认值。
+# 读取失败/非法值同样按默认处理, 精简流程据此决定是否下调。
+_route_buffer_kb() {
+    local kb=""
+    kb=$(_config_jq -r '.policy.levels["0"].bufferSize? // empty' 2>/dev/null) || kb=""
+    if [[ "$kb" =~ ^-?[0-9]+$ ]]; then
+        printf '%s' "$kb"
+    else
+        _route_buffer_default_kb
+    fi
+}
+
+# 展示用: 负值表示无限制, 0 表示不缓冲。
+_route_buffer_label() {
+    case "${1:-}" in
+        -*) printf '无限制' ;;
+        0) printf '0KB' ;;
+        *) printf '%sKB' "${1:-?}" ;;
+    esac
+}
+
 # 删除所有 Geo 规则(含 Geo 节点规则), 保留非 Geo 规则并注入字面量 CIDR 私网 block。
+# 同一事务把每连接内部缓冲降到小内存值; 已是 0 或更小正值时保持不动, 负值会一并收紧。
 # 私网规则插在首条满足 inboundTag? == null 的规则前, 避免抢先拦截 tunnel Reality 握手。
 # 按 ruleTag 去旧再重插以保持幂等; 重建 .routing.rules 避免 routing:null 的 map 报错。
 # ruleTag? // null 保留非对象元素; inboundTag? 不补 null, 避免标量被误当插入点。
 _route_slim_geo_rules() {
     _route_preflight || return 1
     _mutate_config --argjson priv "$XRAY_PRIVATE_BLOCK_RULE_JSON" \
-        ".routing.rules = ([.routing.rules[]?
+        --argjson buf "$XRAY_LOWMEM_BUFFER_KB" --argjson defkb "$(_route_buffer_default_kb)" \
+        "((.policy.levels[\"0\"].bufferSize? // \$defkb) as \$cur
+          | if \$cur < 0 or \$cur > \$buf then .policy.levels[\"0\"].bufferSize = \$buf else . end)
+         | .routing.rules = ([.routing.rules[]?
             | select(${GEO_RULE_REF_JQ} | not)
             | select((.ruleTag? // null) != \"${XRAY_PRIVATE_BLOCK_RULE_TAG}\")] as \$k
           | ([\$k | to_entries[] | select(.value.inboundTag? == null) | .key] | first // (\$k | length)) as \$i
@@ -405,8 +440,15 @@ _route_slim_geo_rules() {
 _route_restore_default_rules() {
     _route_preflight || return 1
     _mutate_config --arg ut "$ROUTE_USER_RULE_TAG" --argjson defs "$XRAY_DEFAULT_ROUTING_RULES_JSON" \
+        --argjson low "$XRAY_LOWMEM_BUFFER_KB" --argjson defkb "$(_route_buffer_default_kb)" \
         '.routing.domainStrategy = "IPIfNonMatch"
-         | .routing.rules = ([.routing.rules[]? | select(.inboundTag? != null and (.ruleTag? // "") != $ut)] + $defs)' || return 1
+         | .routing.rules = ([.routing.rules[]? | select(.inboundTag? != null and (.ruleTag? // "") != $ut)] + $defs)
+         | (if ((.policy.levels["0"].bufferSize? // $defkb) == $low) then
+              del(.policy.levels["0"].bufferSize)
+              | (if ((.policy.levels["0"]? // {}) | length) == 0 then del(.policy.levels["0"]) else . end)
+              | (if ((.policy.levels? // {}) | length) == 0 then del(.policy.levels) else . end)
+              | (if ((.policy? // {}) | length) == 0 then del(.policy) else . end)
+            else . end)' || return 1
     return 0
 }
 
@@ -789,10 +831,15 @@ _route_delete_rule_flow() {
 
 _route_restore_default_flow() {
     _route_preflight || return 1
-    local ans=""
+    local ans="" buf="" defkb=""
+    buf=$(_route_buffer_kb)
+    defkb=$(_route_buffer_default_kb)
     echo
     echo -e "  ${YELLOW}恢复后将重新引用 geosite/geoip 数据, 小内存机器可能再次被 OOM${NC}"
     echo -e "  ${YELLOW}注意: 手工添加的非节点自定义规则(含刚添加的规则)会被丢弃(节点规则保留; 配置已自动备份)${NC}"
+    if [ "$buf" = "$XRAY_LOWMEM_BUFFER_KB" ]; then
+        echo -e "  ${YELLOW}连接缓冲将从小内存值 ${buf}KB 恢复为 Xray 默认 ${defkb}KB${NC}"
+    fi
     read -rp "  确认恢复默认规则? [y/N]: " ans || return 0
     case "$ans" in
         y|Y) ;;
@@ -800,6 +847,9 @@ _route_restore_default_flow() {
     esac
     if _route_restore_default_rules; then
         _success "已恢复默认路由规则(bittorrent / 广告+私网域名 / 私网+CN IP)"
+        if [ "$buf" = "$XRAY_LOWMEM_BUFFER_KB" ] && [ "$(_route_buffer_kb)" = "$defkb" ]; then
+            _tip "连接缓冲已恢复为默认 ${defkb}KB"
+        fi
         _tip "请确认 assets 下 geosite.dat 与 geoip.dat 存在, 否则进入 [9] Geo 数据管理立即更新一次"
     else
         _error "恢复失败(配置已回滚)"
@@ -810,17 +860,23 @@ _route_restore_default_flow() {
 _route_slim_flow() {
     _route_preflight || return 1
     local total=0 geo=0 node=0 mixed=0 stats_ok=1 private_ok=0 stats="" ans="" dnsgeo=""
+    local buf=0 needs_buf=0
     stats=$(_route_rules_stats) || stats_ok=0
     # 失败时不 read 空结果, 避免把已初始化数字覆盖为空并触发算术诊断。
     [ "$stats_ok" -eq 1 ] && read -r total geo node mixed <<< "$stats"
     _route_private_block_valid && private_ok=1
+    buf=$(_route_buffer_kb)
+    # 负值是"无限制"; 0 已比目标更激进, 保持不动。
+    if [ "$buf" -lt 0 ] || [ "$buf" -gt "$XRAY_LOWMEM_BUFFER_KB" ]; then
+        needs_buf=1
+    fi
     # stats 读取失败时 geo/node/mixed 仍是初值 0: 既不能判"已是精简", 也不能拿 0 去确认删除。
     if [ "$stats_ok" -ne 1 ]; then
         _warn "无法读取当前路由规则, 无法判断精简范围, 已取消"
         return 1
     fi
-    if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ]; then
-        _info "已是精简状态(无 geo 引用 + 精简私网规则已注入), 无需重复操作"
+    if [ "$geo" -eq 0 ] && [ "$private_ok" -eq 1 ] && [ "$needs_buf" -eq 0 ]; then
+        _info "已是精简状态(无 geo 引用 + 精简私网规则已注入 + 连接缓冲已优化), 无需重复操作"
         return 0
     fi
     echo
@@ -828,6 +884,9 @@ _route_slim_flow() {
     echo -e "    ${CYAN}删除${NC} ${geo} 条引用 geo 数据的规则"
     echo -e "    ${CYAN}注入${NC} 1 条字面量 CIDR 私网 block 规则(等价 geoip:private, 不加载 dat)"
     echo -e "    ${CYAN}保留${NC} $((node - mixed)) 条不引用 Geo 的节点定向规则(仍在最前) + 其它非 Geo 规则"
+    if [ "$needs_buf" -eq 1 ]; then
+        echo -e "    ${CYAN}降低${NC} 每连接内部缓冲 $(_route_buffer_label "$buf") → ${XRAY_LOWMEM_BUFFER_KB}KB"
+    fi
     [ "$mixed" -gt 0 ] && echo -e "    ${YELLOW}注意${NC} ${mixed} 条同时引用 Geo 的节点定向规则会删除"
     dnsgeo=$(_route_dns_geo_count)
     if [ "$dnsgeo" -gt 0 ]; then
@@ -842,6 +901,9 @@ _route_slim_flow() {
     if _route_slim_geo_rules; then
         _success "路由规则已精简, xray 已用新配置重启"
         _tip "geosite.dat / geoip.dat 不再被加载, 内存占用应明显下降"
+        if [ "$needs_buf" -eq 1 ] && [ "$(_route_buffer_kb)" = "$XRAY_LOWMEM_BUFFER_KB" ]; then
+            _tip "每连接内部缓冲已降至 ${XRAY_LOWMEM_BUFFER_KB}KB, 高并发时内存增长更慢"
+        fi
         if [ "$(_geo_auto_state 2>/dev/null)" = "on" ]; then
             _tip "当前 Geo 自动更新仍为开启; 已无 geo 规则时它没有实际意义, 可在 [9] Geo 数据管理关闭"
         fi

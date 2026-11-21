@@ -147,6 +147,14 @@ readonly XRAY_PRIVATE_BLOCK_RULE_JSON='{
   "outboundTag": "block"
 }'
 
+# 小内存模式: Xray 每连接内部缓冲默认值随架构不同(32 位 ARM/MIPS 0KB,
+# ARM64/MIPS64 4KB, 其它 512KB), 高并发时是主要的匿名内存来源。
+# 只把高于 256KB 或负值(无限制)的当前值降下来; 0 与更小正值保持不动,
+# ARM64/ARM 的默认值也不会被反向抬高。
+# 单位 KB, 对应 config 的 policy.levels."0".bufferSize (features/policy/policy.go)。
+# shellcheck disable=SC2034
+readonly XRAY_LOWMEM_BUFFER_KB=256
+
 # Xray log.loglevel 合法取值。核心对未识别值静默回落 warning, 校验必须由脚本自己做。
 # "none" 同时停写 error 与 access 两个日志(infra/conf/log.go)。
 # shellcheck disable=SC2034
