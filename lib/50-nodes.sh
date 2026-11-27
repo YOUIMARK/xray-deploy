@@ -2430,6 +2430,48 @@ _ask_link_addr() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# SOCKS UDP settings.ip 校验: 必须是服务端本机可达的单播 IP, 不能是通配地址。
+# ---------------------------------------------------------------------------
+_valid_socks_udp_ip() {
+    case "$1" in
+        ""|"0.0.0.0"|"::") return 1 ;;
+    esac
+    _validate_listen "$1"
+}
+
+# ---------------------------------------------------------------------------
+# 询问 SOCKS UDP 回连地址(写入 settings.ip, 必须是服务端本机 IP)
+# 用法: _ask_socks_udp_ip [当前值]
+#   默认选检测到的公网 IP; 检测失败时默认当前值; 仍为空必须手动填写。
+# 输出地址到 stdout; EOF 返回 1
+# ---------------------------------------------------------------------------
+_ask_socks_udp_ip() {
+    local current="${1:-}" def="" hint
+    def=$(_get_public_ip 2>/dev/null) || def=""
+    [ -n "$def" ] || def="$current"
+    if [ -n "$def" ]; then
+        hint="回车默认 ${def}"
+    else
+        hint="必填"
+    fi
+    while true; do
+        local addr
+        read -rp "  UDP 回连地址 (${hint}): " addr || return 1
+        if [ -z "$addr" ]; then
+            if [ -n "$def" ]; then
+                echo "$def"; return 0
+            fi
+            _warn "无法自动检测 IP, 请手动填写服务端本机 IP"
+            continue
+        fi
+        if _valid_socks_udp_ip "$addr"; then
+            echo "$addr"; return 0
+        fi
+        _warn "必须是合法的单播 IP 地址(不能填域名或通配地址)"
+    done
+}
+
 _node_count() {
     local n=0
     for f in "$NODES_DIR"/*.json; do
@@ -3436,11 +3478,10 @@ _add_socks() {
     read -rp "  客户端连接地址 (回车用 127.0.0.1): " addr || { _warn "输入已结束, 已取消"; return 1; }
     addr=${addr:-127.0.0.1}
 
-    local ip_block=""
+    local ip_block="" udp_ip=""
     if [ "$udp" = "true" ]; then
-        # settings.ip 必须是本机可达地址; 域名不能直接用于 UDP 关联。
-        local udp_ip="127.0.0.1"
-        _validate_listen "$addr" && udp_ip="$addr"
+        # settings.ip 是客户端回连的服务端本机 IP, 与 link_addr(客户端连接地址)语义不同。
+        udp_ip=$(_ask_socks_udp_ip) || { _error "未获取到 UDP 回连地址(输入已结束), 已取消(未写入 config)"; return 1; }
         ip_block=",
         \"ip\": \"$udp_ip\""
     fi
@@ -3459,9 +3500,10 @@ _add_socks() {
         --arg tag "$tag" --arg name "$name" --arg proto "socks" \
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg username "$username" --arg password "$password" \
-        --argjson udp "$udp" --arg link "$link" \
+        --argjson udp "$udp" --arg udp_ip "$udp_ip" --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$username,
-          username:$username,password:$password,udp:$udp,share_link:$link}')
+          username:$username,password:$password,udp:$udp,
+          udp_ip:(if $udp then $udp_ip else null end),share_link:$link}')
     _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
 
     _success "节点 [${name}] 创建成功"
@@ -5626,7 +5668,7 @@ _update_listen_commit() {
 }
 
 _update_listen_commit_locked() {
-    local tag="$1" expected="$2" newlisten="$3" newaddr="$4" newlink="$5"
+    local tag="$1" expected="$2" newlisten="$3" newaddr="$4" newlink="$5" newudpip="${6:-}"
     local meta="$NODES_DIR/${tag}.json" now old_inbound oldlisten had_listen
     now=$(_node_identity "$tag") || { _error "无法重新读取节点身份, 监听未更新: $tag"; return 1; }
     if [ "$now" != "$expected" ]; then
@@ -5640,12 +5682,17 @@ _update_listen_commit_locked() {
     }
     had_listen=$(jq -r '.[0] | has("listen")' <<< "$old_inbound")
     oldlisten=$(jq -c '.[0].listen' <<< "$old_inbound")
-    # SOCKS 开启 UDP 时 settings.ip 必须是本机可达 IP; 域名等非 IP 值不写入。
-    local socks_ip_update="false" socks_ip="$newaddr"
-    if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "socks" ] && \
-        [ "$(jq -r '.udp // false' "$meta" 2>/dev/null)" = "true" ]; then
+    # settings.ip 是 SOCKS UDP 的服务端回连地址, 与 link_addr 独立: 只接受调用方显式
+    # 传入的合法 IP; 未传(空)时保持原值, 绝不从监听/链接地址推导。
+    local socks_ip_update="false" socks_ip="" old_socks_ip=""
+    if [ -n "$newudpip" ]; then
+        if ! _valid_socks_udp_ip "$newudpip"; then
+            _error "UDP 回连地址必须是合法的单播 IP, 监听未更新"
+            return 1
+        fi
         socks_ip_update="true"
-        _validate_listen "$socks_ip" || socks_ip="127.0.0.1"
+        socks_ip="$newudpip"
+        old_socks_ip=$(jq -c '.[0].settings.ip // null' <<< "$old_inbound" 2>/dev/null)
     fi
     if ! _mutate_config --arg t "$tag" --arg l "$newlisten" --arg a "$socks_ip" --argjson u "$socks_ip_update" \
          '(.inbounds[] | select(.tag == $t)) |= (.listen = $l | if $u then (.settings.ip = $a) else . end)'; then
@@ -5654,9 +5701,11 @@ _update_listen_commit_locked() {
     fi
     if [ -n "$newlink" ]; then
         if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if $u then .udp_ip=$i else . end)
             | (if has("preferred_addr") then .preferred_addr=$a else . end)
             | .share_link=$link' \
-            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink"; then
+            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" \
+            --argjson u "$socks_ip_update" --arg i "$socks_ip"; then
             if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
                 _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
             fi
@@ -5664,8 +5713,10 @@ _update_listen_commit_locked() {
         fi
     else
         if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if $u then .udp_ip=$i else . end)
             | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
-            --arg l "$newlisten" --arg a "$newaddr"; then
+            --arg l "$newlisten" --arg a "$newaddr" \
+            --argjson u "$socks_ip_update" --arg i "$socks_ip"; then
             if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
                 _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
             fi
@@ -5674,7 +5725,13 @@ _update_listen_commit_locked() {
     fi
     _error "监听元数据写入失败, 正在恢复 config 监听..."
     if ! _mutate_config --arg t "$tag" --argjson old "$oldlisten" --argjson had "$had_listen" \
-        '(.inbounds[] | select(.tag == $t)) |= (if $had then .listen=$old else del(.listen) end)'; then
+        --argjson u "$socks_ip_update" --arg i "$socks_ip" \
+        --argjson oldip "$old_socks_ip" \
+        '(.inbounds[] | select(.tag == $t)) |= (if $had then .listen=$old else del(.listen) end)
+         | (if $u then (.inbounds[] | select(.tag == $t))
+             |= (if (.settings | type == "object" and has("ip")) then .settings.ip=$oldip
+                 else (if (.settings | type == "object") then del(.settings.ip) else . end) end)
+            else . end)'; then
         _error "config 监听回滚失败, 请手动检查节点与 metadata"
     fi
     return 1
@@ -5731,6 +5788,7 @@ _update_listen() {
     local proto oldaddr newaddr
     proto=$(jq -r '.protocol' "$meta")
     oldaddr=$(jq -r '.link_addr' "$meta")
+    local newudpip=""
     # CDN 协议强制填域名(CDN 节点填公网 IP 会导致直连失效)
     case "$proto" in *-cdn)
         echo -e "  ${YELLOW}该节点为 CDN 协议, 必须使用 CDN 域名${NC}"
@@ -5769,6 +5827,15 @@ _update_listen() {
     esac
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
+    # SOCKS UDP 的回连地址与链接地址独立: 开启 UDP 时必须单独确认服务端本机 IP。
+    if [ "$proto" = "socks" ] && [ "$(jq -r '.udp // false' "$meta" 2>/dev/null)" = "true" ]; then
+        local curudpip; curudpip=$(jq -r '.udp_ip // empty' "$meta" 2>/dev/null)
+        echo -e "  ${YELLOW}UDP 回连地址是客户端访问 UDP 时连接的服务端本机 IP, 与链接服务器地址无关${NC}"
+        newudpip=$(_ask_socks_udp_ip "$curudpip") || {
+            _error "未获取到 UDP 回连地址(输入已结束), 监听未更新"; _press_any_key; return 1
+        }
+    fi
+
     # 地址改写统一 _rewrite_link_addr；失败时仅更新权威记录。
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
@@ -5776,11 +5843,12 @@ _update_listen() {
     if [ -z "$newlink" ]; then
         _warn "分享链接非标准格式(被采纳节点?), 仅更新监听与链接地址记录"
     fi
-    if ! _update_listen_commit "$tag" "$listen_identity" "$newlisten" "$newaddr" "$newlink"; then
+    if ! _update_listen_commit "$tag" "$listen_identity" "$newlisten" "$newaddr" "$newlink" "$newudpip"; then
         _press_any_key
         return 1
     fi
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
+    [ -n "$newudpip" ] && echo -e "  UDP 回连地址: ${CYAN}${newudpip}${NC}"
     _press_any_key
 }
 

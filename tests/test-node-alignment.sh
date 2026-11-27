@@ -972,6 +972,92 @@ socks_template_udp_probe() (
 )
 check 'SOCKS template enables udp with reachable address when requested' socks_template_udp_probe
 
+# settings.ip 必须是服务端本机 IP; 创建时 link_addr(客户端地址)与本机回连地址互不推导。
+socks_udp_ip_probe() (
+    local dir="$TMP/socks-nodes"
+    NODES_DIR="$dir/nodes"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    _get_public_ip() { printf '198.51.100.20'; }
+    _commit_node_txn() { printf '%s' "$2" > "$TMP/socks-inbound.json"; printf '%s' "$3" > "$TMP/socks-meta.json"; }
+    printf '2\n20808\n\n\n\n203.0.113.7\n' | _add_socks >/dev/null 2>&1 || return 1
+    jq -e '.settings.udp == true and .settings.ip == "203.0.113.7"' "$TMP/socks-inbound.json" >/dev/null || return 1
+    jq -e '.udp_ip == "203.0.113.7" and .link_addr == "127.0.0.1"' "$TMP/socks-meta.json" >/dev/null
+)
+check 'SOCKS creation asks a dedicated UDP ip' socks_udp_ip_probe
+
+socks_udp_ip_default_probe() (
+    local dir="$TMP/socks-default-nodes"
+    NODES_DIR="$dir/nodes"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    _get_public_ip() { printf '198.51.100.20'; }
+    _commit_node_txn() { printf '%s' "$2" > "$TMP/socks-default-inbound.json"; printf '%s' "$3" > "$TMP/socks-default-meta.json"; }
+    printf '2\n20809\n\n\n\n\n' | _add_socks >/dev/null 2>&1 || return 1
+    jq -e '.settings.ip == "198.51.100.20"' "$TMP/socks-default-inbound.json" >/dev/null || return 1
+    jq -e '.udp_ip == "198.51.100.20"' "$TMP/socks-default-meta.json" >/dev/null
+)
+check 'SOCKS creation defaults UDP ip to detected address' socks_udp_ip_default_probe
+
+# 更新监听时 UDP 回连地址独立更新, 且不因 link_addr 变成域名而降级。
+socks_listen_udp_ip_probe() (
+    local tag=socks-listen meta dir="$TMP/socks-listen"
+    NODES_DIR="$dir/nodes" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" BACKUP_DIR="$dir/backup"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR" "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR"
+    meta="$NODES_DIR/$tag.json"
+    jq -n '{tag:"socks-listen",protocol:"socks",name:"socks-listen",port:1080,
+        listen:"127.0.0.1",link_addr:"127.0.0.1",username:"u",password:"p",
+        udp:true,udp_ip:"203.0.113.7",share_link:"socks5://u:p@127.0.0.1:1080#socks-listen"}' > "$meta"
+    _node_identity() { printf same; }
+    _config_jq() { case "$*" in *inbounds*) printf '[{"tag":"socks-listen","listen":"127.0.0.1","settings":{"auth":"password","udp":true,"ip":"203.0.113.7"}}]' ;; *) printf 'null' ;; esac; }
+    _mutate_config() { return 0; }
+    _update_listen_commit_locked "$tag" same :: edge.example \
+        'socks5://u:p@edge.example:1080#socks-listen' 198.51.100.30 || return 1
+    jq -e '.listen == "::" and .link_addr == "edge.example" and .udp_ip == "198.51.100.30"' "$meta" >/dev/null || return 1
+    jq -e '.listen == "::" and .link_addr == "edge.example"' "$meta" >/dev/null
+)
+check 'SOCKS listen update keeps a separate UDP ip' socks_listen_udp_ip_probe
+
+# metadata 写失败时 config 的 listen 与 settings.ip 必须一起回滚。
+socks_listen_rollback_probe() (
+    local tag=socks-rollback meta dir="$TMP/socks-rollback" calls=0
+    NODES_DIR="$dir/nodes" CONFIG_DIR="$dir/confs" STATE_DIR="$dir/state" BACKUP_DIR="$dir/backup"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR" "$CONFIG_DIR" "$STATE_DIR" "$BACKUP_DIR"
+    meta="$NODES_DIR/$tag.json"
+    jq -n '{tag:"socks-rollback",protocol:"socks",name:"socks-rollback",port:1080,
+        listen:"127.0.0.1",link_addr:"127.0.0.1",username:"u",password:"p",
+        udp:true,udp_ip:"203.0.113.7",share_link:"socks5://u:p@127.0.0.1:1080#socks-rollback"}' > "$meta"
+    _node_identity() { printf same; }
+    _config_jq() { case "$*" in *inbounds*) printf '[{"tag":"socks-rollback","listen":"127.0.0.1","settings":{"auth":"password","udp":true,"ip":"203.0.113.7"}}]' ;; *) printf 'null' ;; esac; }
+    _mutate_config() {
+        calls=$((calls+1))
+        if [ "$calls" -eq 2 ]; then
+            printf '%s\n' "$*" > "$TMP/socks-rollback-args"
+            jq -n --argjson old '"127.0.0.1"' --argjson oldip '"203.0.113.7"' \
+                '{tag:"socks-rollback",listen:$old,settings:{auth:"password",udp:true,ip:$oldip}}' \
+                > "$TMP/socks-rollback-config"
+        fi
+        return 0
+    }
+    _meta_update() { return 1; }
+    _update_listen_commit_locked "$tag" same :: edge.example '' 198.51.100.30 >/dev/null 2>&1 && return 1
+    jq -e '.listen == "127.0.0.1" and .settings.ip == "203.0.113.7"' "$TMP/socks-rollback-config" >/dev/null || return 1
+    jq -e '.listen == "127.0.0.1" and .udp_ip == "203.0.113.7"' "$meta" >/dev/null
+)
+check 'SOCKS metadata failure rolls back listen and UDP ip' socks_listen_rollback_probe
+
+socks_udp_ip_validation_probe() (
+    local dir="$TMP/socks-validation" rc=0
+    NODES_DIR="$dir/nodes"
+    rm -rf "$dir"; mkdir -p "$NODES_DIR"
+    _get_public_ip() { return 1; }
+    _commit_node_txn() { printf '%s' "$2" > "$TMP/socks-validation-inbound.json"; printf '%s' "$3" > "$TMP/socks-validation-meta.json"; }
+    printf '2\n20810\n\n\n0.0.0.0\n::\nexample.com\n203.0.113.9\n' | _add_socks >/dev/null 2>&1 || return 1
+    jq -e '.settings.ip == "203.0.113.9"' "$TMP/socks-validation-inbound.json" >/dev/null || return 1
+    printf '203.0.113.10\n' | _add_socks >/dev/null 2>&1 && return 1
+    _update_listen_commit_locked socks-x same :: edge.example '' 0.0.0.0 >/dev/null 2>&1 && return 1
+    return 0
+)
+check 'SOCKS UDP ip rejects wildcard and domain values' socks_udp_ip_validation_probe
+
 # 分享链接必须能被本仓库导入端原样解析, 且凭据/名称经百分号编码后无损。
 socks_share_link_roundtrip_probe() (
     local user="xd%user" pass="p@ss:word" name="SOCKS 测试" link out
