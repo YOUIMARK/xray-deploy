@@ -1,0 +1,21 @@
+{
+    "listen": "{{LISTEN}}",
+    "port": {{PORT}},
+    "protocol": "socks",
+    "tag": "{{TAG}}",
+    "settings": {
+        "auth": "password",
+        "users": [
+            {
+                "user": "{{USERNAME}}",
+                "pass": "{{PASSWORD}}"
+            }
+        ],
+        "udp": {{UDP}}{{SOCKS_IP_BLOCK}}
+    },
+    "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+    }
+}

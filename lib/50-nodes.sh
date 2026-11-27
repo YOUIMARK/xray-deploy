@@ -12,6 +12,7 @@ PROTOCOLS=(
     "vless-ws-cdn|VLESS+WS(无TLS)|none|cdn"
     "shadowsocks|Shadowsocks|none|direct"
     "hysteria2|Hysteria2|tls|direct"
+    "socks|SOCKS5|none|direct"
 )
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +1911,7 @@ _render_template() {
     : "${R_CONGESTION:=}" "${R_BRUTAL_PARAMS_BLOCK:=}" "${R_OBFS_MASK_BLOCK:=}"
     : "${R_TUNNEL_PORT:=}"
     : "${R_FLOW:=}" "${R_DECRYPTION:=none}" "${R_NETWORK:=}"
+    : "${R_USERNAME:=}" "${R_UDP:=false}" "${R_IP_BLOCK:=}"
 
     # 模板已是纯 JSON(无注释),无需 sed 去注释
 
@@ -1931,6 +1933,9 @@ _render_template() {
     p="{{DECRYPTION}}";    content="${content//$p/"$R_DECRYPTION"}"
     p="{{NETWORK}}";      content="${content//$p/"$R_NETWORK"}"
     p="{{AUTH}}";         content="${content//$p/"$R_AUTH"}"
+    p="{{USERNAME}}";     content="${content//$p/"$R_USERNAME"}"
+    p="{{UDP}}";          content="${content//$p/"$R_UDP"}"
+    p="{{SOCKS_IP_BLOCK}}"; content="${content//$p/"$R_IP_BLOCK"}"
     p="{{CERT_FILE}}";    content="${content//$p/"$R_CERT_FILE"}"
     p="{{KEY_FILE}}";     content="${content//$p/"$R_KEY_FILE"}"
     p="{{CONGESTION}}";   content="${content//$p/"$R_CONGESTION"}"
@@ -2425,6 +2430,48 @@ _ask_link_addr() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# SOCKS UDP settings.ip 校验: 必须是服务端本机可达的单播 IP, 不能是通配地址。
+# ---------------------------------------------------------------------------
+_valid_socks_udp_ip() {
+    case "$1" in
+        ""|"0.0.0.0"|"::") return 1 ;;
+    esac
+    _validate_listen "$1"
+}
+
+# ---------------------------------------------------------------------------
+# 询问 SOCKS UDP 回连地址(写入 settings.ip, 必须是服务端本机 IP)
+# 用法: _ask_socks_udp_ip [当前值]
+#   默认选检测到的公网 IP; 检测失败时默认当前值; 仍为空必须手动填写。
+# 输出地址到 stdout; EOF 返回 1
+# ---------------------------------------------------------------------------
+_ask_socks_udp_ip() {
+    local current="${1:-}" def="" hint
+    def=$(_get_public_ip 2>/dev/null) || def=""
+    [ -n "$def" ] || def="$current"
+    if [ -n "$def" ]; then
+        hint="回车默认 ${def}"
+    else
+        hint="必填"
+    fi
+    while true; do
+        local addr
+        read -rp "  UDP 回连地址 (${hint}): " addr || return 1
+        if [ -z "$addr" ]; then
+            if [ -n "$def" ]; then
+                echo "$def"; return 0
+            fi
+            _warn "无法自动检测 IP, 请手动填写服务端本机 IP"
+            continue
+        fi
+        if _valid_socks_udp_ip "$addr"; then
+            echo "$addr"; return 0
+        fi
+        _warn "必须是合法的单播 IP 地址(不能填域名或通配地址)"
+    done
+}
+
 _node_count() {
     local n=0
     for f in "$NODES_DIR"/*.json; do
@@ -2846,6 +2893,7 @@ _add_node() {
         vless-ws-cdn)             _add_vless_ws_cdn ;;
         shadowsocks)              _add_shadowsocks ;;
         hysteria2)                _add_hysteria2 ;;
+        socks)                    _add_socks ;;
         *) _warn "未知协议" ;;
     esac
     _press_any_key
@@ -3379,6 +3427,83 @@ _add_shadowsocks() {
         --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
         --arg method "$method" --arg password "$password" --arg link "$link" \
         '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,method:$method,password:$password,share_link:$link}')
+    _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
+
+    _success "节点 [${name}] 创建成功"
+    echo -e "  ${CYAN}分享链接:${NC} ${link}"
+}
+
+# ---------------------------------------------------------------------------
+# 协议7: SOCKS5(账号密码认证, 默认仅本机监听, UDP 默认关闭)
+# ---------------------------------------------------------------------------
+_add_socks() {
+    echo -e "\n  ${CYAN}=== SOCKS5 (账号密码认证) ===${NC}"
+    _warn "SOCKS 不加密, 默认仅监听 127.0.0.1; 对外提供时请自行评估风险"
+
+    # UDP 默认关闭: 开启会额外占用 UDP, 由用户显式选择。
+    echo -e "  协议:"
+    echo -e "  ${GREEN}[1]${NC} 仅 TCP"
+    echo -e "  ${GREEN}[2]${NC} TCP+UDP"
+    read -rp "  选择 (回车=仅 TCP): " net_choice
+    local udp=false
+    case "${net_choice:-1}" in
+        2) udp=true ;;
+        *) udp=false ;;
+    esac
+
+    local port_proto="tcp"
+    [ "$udp" = "true" ] && port_proto=""
+    local port; port=$(_input_port "$port_proto") || return 1
+
+    local username="xd$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    read -rp "  用户名 (默认 ${username}): " custom_user
+    username=${custom_user:-$username}
+    _validate_json_text "$username" || { _error "用户名含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+    [ -n "$username" ] || { _error "用户名不能为空"; return 1; }
+
+    local password
+    password=$(head -c 18 /dev/urandom | base64 | tr -d '\n=+/' | head -c 24)
+    read -rp "  密码 (默认随机): " custom_pw
+    password=${custom_pw:-$password}
+    _validate_json_text "$password" || { _error "密码含非法字符(双引号/反斜杠/换行/制表符或 {{), 请更换"; return 1; }
+    [ -n "$password" ] || { _error "密码不能为空"; return 1; }
+
+    local default_name="SOCKS-${port}"
+    _node_name_prompt || return 1
+
+    local tag="xd-socks-${port}"
+    local listen="127.0.0.1"
+    # 默认仅本机可达: 链接地址跟随监听, 需要转发到内网/公网时再改。
+    local addr
+    read -rp "  客户端连接地址 (回车用 127.0.0.1): " addr || { _warn "输入已结束, 已取消"; return 1; }
+    addr=${addr:-127.0.0.1}
+
+    local ip_block="" udp_ip=""
+    if [ "$udp" = "true" ]; then
+        # settings.ip 是客户端回连的服务端本机 IP, 与 link_addr(客户端连接地址)语义不同。
+        udp_ip=$(_ask_socks_udp_ip) || { _error "未获取到 UDP 回连地址(输入已结束), 已取消(未写入 config)"; return 1; }
+        ip_block=",
+        \"ip\": \"$udp_ip\""
+    fi
+    R_LISTEN="$listen" R_PORT="$port" R_TAG="$tag" \
+        R_USERNAME="$username" R_PASSWORD="$password" R_UDP="$udp" R_IP_BLOCK="$ip_block"
+    local inbound
+    inbound=$(_render_template "$(_tpl_path socks)") || return 1
+
+    # SOCKS 链接 userinfo: 用户名/密码分别百分号编码, 冒号作分隔符保留。
+    local link_ip; link_ip=$(_link_host "$addr")
+    local link
+    link="socks5://$(_url_encode "$username"):$(_url_encode "$password")@${link_ip}:${port}#$(_url_encode "$name")"
+
+    local meta_json
+    meta_json=$(jq -n \
+        --arg tag "$tag" --arg name "$name" --arg proto "socks" \
+        --argjson port "$port" --arg listen "$listen" --arg addr "$addr" \
+        --arg username "$username" --arg password "$password" \
+        --argjson udp "$udp" --arg udp_ip "$udp_ip" --arg link "$link" \
+        '{tag:$tag,name:$name,protocol:$proto,port:$port,listen:$listen,link_addr:$addr,auth:$username,
+          username:$username,password:$password,udp:$udp,
+          udp_ip:(if $udp then $udp_ip else null end),share_link:$link}')
     _commit_node_txn "$tag" "$inbound" "$meta_json" || return 1
 
     _success "节点 [${name}] 创建成功"
@@ -4454,6 +4579,7 @@ _tpl_path() {
         vless-ws-cdn)             echo "/opt/xray-deploy/templates/vless-ws-cdn.server.jsonc" ;;
         shadowsocks)              echo "/opt/xray-deploy/templates/shadowsocks.server.jsonc" ;;
         hysteria2)                echo "/opt/xray-deploy/templates/hysteria2.server.jsonc" ;;
+        socks)                    echo "/opt/xray-deploy/templates/socks.server.jsonc" ;;
     esac
 }
 
@@ -4521,6 +4647,7 @@ _view_nodes() {
             if [ "$auth" != "—" ]; then
                 case "$proto" in
                     hysteria2) echo -e "  认证密码: ${auth}" ;;
+                    socks)     echo -e "  认证用户: ${auth}" ;;
                     *)         echo -e "  认证算法: ${auth}" ;;
                 esac
             fi
@@ -5069,6 +5196,17 @@ _port_txn_build_newmeta() {
     case "$proto" in
         vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
+        socks)
+            local s_user s_pass s_addr
+            s_user=$(jq -r '.username // empty' "$tmpm") || rebuild_rc=1
+            s_pass=$(jq -r '.password // empty' "$tmpm") || rebuild_rc=1
+            s_addr=$(jq -r '.link_addr // empty' "$tmpm") || rebuild_rc=1
+            if [ -n "$s_user" ] && [ -n "$s_addr" ]; then
+                newlink="socks5://$(_url_encode "$s_user"):$(_url_encode "$s_pass")@$(_link_host "$s_addr"):${newport}#$(_url_encode "$new_name")"
+            else
+                rebuild_rc=1
+            fi
+            ;;
         *)
             local oldlink
             oldlink=$(jq -r '.share_link // empty' <<< "$orig" 2>/dev/null)
@@ -5404,6 +5542,11 @@ _modify_port() {
         hysteria2) port_proto="udp" ;;
         shadowsocks)
             case "$(_inbound_network "$tag")" in *udp*) port_proto="udp" ;; esac ;;
+        socks)
+            case "$(_config_jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .settings.udp // false' 2>/dev/null)" in
+                true) port_proto="" ;;
+            esac
+            ;;
     esac
     local newport; newport=$(_input_port "$port_proto" "$tag") || return 1
 
@@ -5479,6 +5622,17 @@ _modify_port() {
     case "$proto" in
         vless-enc) newlink=$(_rebuild_vless_enc_link "$tmpm") || rebuild_rc=1 ;;
         vless-xhttp-cdn|vless-ws-cdn) newlink=$(_rebuild_cdn_link "$tmpm") || rebuild_rc=1 ;;
+        socks)
+            local s_user s_pass s_addr
+            s_user=$(jq -r '.username // empty' "$tmpm") || rebuild_rc=1
+            s_pass=$(jq -r '.password // empty' "$tmpm") || rebuild_rc=1
+            s_addr=$(jq -r '.link_addr // empty' "$tmpm") || rebuild_rc=1
+            if [ -n "$s_user" ] && [ -n "$s_addr" ]; then
+                newlink="socks5://$(_url_encode "$s_user"):$(_url_encode "$s_pass")@$(_link_host "$s_addr"):${newport}#$(_url_encode "$new_name")"
+            else
+                rebuild_rc=1
+            fi
+            ;;
         *)
             # 其它协议用@后host:port锚定替换；path/sni/name里的端口不改。
             local oldlink; oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
@@ -5514,7 +5668,7 @@ _update_listen_commit() {
 }
 
 _update_listen_commit_locked() {
-    local tag="$1" expected="$2" newlisten="$3" newaddr="$4" newlink="$5"
+    local tag="$1" expected="$2" newlisten="$3" newaddr="$4" newlink="$5" newudpip="${6:-}"
     local meta="$NODES_DIR/${tag}.json" now old_inbound oldlisten had_listen
     now=$(_node_identity "$tag") || { _error "无法重新读取节点身份, 监听未更新: $tag"; return 1; }
     if [ "$now" != "$expected" ]; then
@@ -5528,16 +5682,30 @@ _update_listen_commit_locked() {
     }
     had_listen=$(jq -r '.[0] | has("listen")' <<< "$old_inbound")
     oldlisten=$(jq -c '.[0].listen' <<< "$old_inbound")
-    if ! _mutate_config --arg t "$tag" --arg l "$newlisten" \
-         '(.inbounds[] | select(.tag == $t) | .listen) = $l'; then
+    # settings.ip 是 SOCKS UDP 的服务端回连地址, 与 link_addr 独立: 只接受调用方显式
+    # 传入的合法 IP; 未传(空)时保持原值, 绝不从监听/链接地址推导。
+    local socks_ip_update="false" socks_ip="" old_socks_ip=""
+    if [ -n "$newudpip" ]; then
+        if ! _valid_socks_udp_ip "$newudpip"; then
+            _error "UDP 回连地址必须是合法的单播 IP, 监听未更新"
+            return 1
+        fi
+        socks_ip_update="true"
+        socks_ip="$newudpip"
+        old_socks_ip=$(jq -c '.[0].settings.ip // null' <<< "$old_inbound" 2>/dev/null)
+    fi
+    if ! _mutate_config --arg t "$tag" --arg l "$newlisten" --arg a "$socks_ip" --argjson u "$socks_ip_update" \
+         '(.inbounds[] | select(.tag == $t)) |= (.listen = $l | if $u then (.settings.ip = $a) else . end)'; then
         _error "监听修改失败, 已回滚"
         return 1
     fi
     if [ -n "$newlink" ]; then
         if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if $u then .udp_ip=$i else . end)
             | (if has("preferred_addr") then .preferred_addr=$a else . end)
             | .share_link=$link' \
-            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink"; then
+            --arg l "$newlisten" --arg a "$newaddr" --arg link "$newlink" \
+            --argjson u "$socks_ip_update" --arg i "$socks_ip"; then
             if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
                 _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
             fi
@@ -5545,8 +5713,10 @@ _update_listen_commit_locked() {
         fi
     else
         if _meta_update "$meta" '.listen=$l | .link_addr=$a
+            | (if $u then .udp_ip=$i else . end)
             | (if has("preferred_addr") then .preferred_addr=$a else . end)' \
-            --arg l "$newlisten" --arg a "$newaddr"; then
+            --arg l "$newlisten" --arg a "$newaddr" \
+            --argjson u "$socks_ip_update" --arg i "$socks_ip"; then
             if [ "$(jq -r '.protocol // empty' "$meta" 2>/dev/null)" = "hysteria2" ]; then
                 _hy2_sync_derived "$meta" || _warn "分享链接未完成同步(原因见上方告警), 请核对 ${meta}"
             fi
@@ -5555,7 +5725,13 @@ _update_listen_commit_locked() {
     fi
     _error "监听元数据写入失败, 正在恢复 config 监听..."
     if ! _mutate_config --arg t "$tag" --argjson old "$oldlisten" --argjson had "$had_listen" \
-        '(.inbounds[] | select(.tag == $t)) |= (if $had then .listen=$old else del(.listen) end)'; then
+        --argjson u "$socks_ip_update" --arg i "$socks_ip" \
+        --argjson oldip "$old_socks_ip" \
+        '(.inbounds[] | select(.tag == $t)) |= (if $had then .listen=$old else del(.listen) end)
+         | (if $u then (.inbounds[] | select(.tag == $t))
+             |= (if (.settings | type == "object" and has("ip")) then .settings.ip=$oldip
+                 else (if (.settings | type == "object") then del(.settings.ip) else . end) end)
+            else . end)'; then
         _error "config 监听回滚失败, 请手动检查节点与 metadata"
     fi
     return 1
@@ -5612,6 +5788,7 @@ _update_listen() {
     local proto oldaddr newaddr
     proto=$(jq -r '.protocol' "$meta")
     oldaddr=$(jq -r '.link_addr' "$meta")
+    local newudpip=""
     # CDN 协议强制填域名(CDN 节点填公网 IP 会导致直连失效)
     case "$proto" in *-cdn)
         echo -e "  ${YELLOW}该节点为 CDN 协议, 必须使用 CDN 域名${NC}"
@@ -5620,6 +5797,19 @@ _update_listen() {
         # CDN只接受域名；复用 _validate_domain，避免IPv4被当作域名。回车沿用旧地址。
         if [ -n "$newaddr" ]; then
             _validate_domain "$newaddr" || { _warn "CDN 节点须填域名, 而非 IP"; _press_any_key; return; }
+        fi
+        ;;
+    socks)
+        if _is_listen_loopback "$newlisten"; then
+            echo -e "  ${YELLOW}监听已改为回环, 该节点仅本机可达${NC}"
+            echo -e "  当前链接服务器地址: ${oldaddr}"
+            read -rp "  链接服务器地址 (回车用 127.0.0.1): " newaddr
+            newaddr=${newaddr:-127.0.0.1}
+        else
+            echo -e "  监听已改为全监听(${newlisten}), 该节点对外可达"
+            local pubip; pubip=$(_get_public_ip)
+            read -rp "  请输入链接服务器地址(公网 IP/域名, 默认 ${pubip}): " newaddr
+            newaddr=${newaddr:-$pubip}
         fi
         ;;
     *)
@@ -5637,6 +5827,15 @@ _update_listen() {
     esac
     [ -z "$newaddr" ] && newaddr="$oldaddr"
 
+    # SOCKS UDP 的回连地址与链接地址独立: 开启 UDP 时必须单独确认服务端本机 IP。
+    if [ "$proto" = "socks" ] && [ "$(jq -r '.udp // false' "$meta" 2>/dev/null)" = "true" ]; then
+        local curudpip; curudpip=$(jq -r '.udp_ip // empty' "$meta" 2>/dev/null)
+        echo -e "  ${YELLOW}UDP 回连地址是客户端访问 UDP 时连接的服务端本机 IP, 与链接服务器地址无关${NC}"
+        newudpip=$(_ask_socks_udp_ip "$curudpip") || {
+            _error "未获取到 UDP 回连地址(输入已结束), 监听未更新"; _press_any_key; return 1
+        }
+    fi
+
     # 地址改写统一 _rewrite_link_addr；失败时仅更新权威记录。
     local oldlink newlink
     oldlink=$(jq -r '.share_link' "$meta" 2>/dev/null)
@@ -5644,11 +5843,12 @@ _update_listen() {
     if [ -z "$newlink" ]; then
         _warn "分享链接非标准格式(被采纳节点?), 仅更新监听与链接地址记录"
     fi
-    if ! _update_listen_commit "$tag" "$listen_identity" "$newlisten" "$newaddr" "$newlink"; then
+    if ! _update_listen_commit "$tag" "$listen_identity" "$newlisten" "$newaddr" "$newlink" "$newudpip"; then
         _press_any_key
         return 1
     fi
     _success "监听已更新为 ${newlisten}, 链接地址更新为 ${newaddr}"
+    [ -n "$newudpip" ] && echo -e "  UDP 回连地址: ${CYAN}${newudpip}${NC}"
     _press_any_key
 }
 
