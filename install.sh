@@ -19,7 +19,7 @@ ROLLBACK_DIR="$DEPLOY_DIR/.install-rollback.$$"
 
 # LIB_MODULES 与运行入口一致，TPL_NAMES 列全模板；避免安装与加载清单漂移。
 LIB_MODULES="00-common 10-system 20-xray-core 30-geo 35-warp 40-cloudflared 45-logrotate 50-nodes 51-reality-pq 52-outbounds 90-menu"
-TPL_NAMES="vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel vless-tcp-reality-vision-direct vless-xhttp-reality-direct tunnel vless-enc vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2"
+TPL_NAMES="vless-tcp-reality-vision-tunnel vless-xhttp-reality-tunnel vless-tcp-reality-vision-direct vless-xhttp-reality-direct tunnel vless-enc vless-xhttp-cdn vless-ws-cdn shadowsocks hysteria2 socks"
 
 # root 检测
 [ "$(id -u)" -ne 0 ] && { echo "[错误] 请以 root 运行"; exit 1; }

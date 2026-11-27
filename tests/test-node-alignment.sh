@@ -937,6 +937,72 @@ missing_tunnel_port_probe() (
 )
 check 'missing tunnel_port is derived from config and backfilled' missing_tunnel_port_probe
 
+# SOCKS: 协议清单可选中, 模板默认 password 认证/监听 127.0.0.1/udp 关闭。
+socks_protocol_probe() (
+    local entry="" found=""
+    for entry in "${PROTOCOLS[@]}"; do
+        case "$entry" in socks\|*) found="$entry" ;; esac
+    done
+    [ -n "$found" ] || return 1
+    eq "${found%%|*}" socks
+)
+check 'SOCKS is listed in protocol menu' socks_protocol_probe
+
+socks_template_probe() (
+    local inbound
+    R_LISTEN="127.0.0.1" R_PORT=10808 R_TAG="xd-socks-10808" \
+        R_USERNAME="xduser" R_PASSWORD="p@ss:word" R_UDP=false R_IP_BLOCK=""
+    inbound=$(_render_template "$(_tpl_path socks)") || return 1
+    jq -e '.protocol == "socks"
+        and .listen == "127.0.0.1"
+        and .port == 10808
+        and .settings.auth == "password"
+        and .settings.users == [{"user":"xduser","pass":"p@ss:word"}]
+        and .settings.udp == false' <<< "$inbound" >/dev/null
+)
+check 'SOCKS template defaults to loopback listen with udp disabled' socks_template_probe
+
+socks_template_udp_probe() (
+    local inbound
+    R_LISTEN="127.0.0.1" R_PORT=10809 R_TAG="xd-socks-10809" \
+        R_USERNAME="xduser" R_PASSWORD="secret" R_UDP=true R_IP_BLOCK=',
+        "ip": "203.0.113.10"'
+    inbound=$(_render_template "$(_tpl_path socks)") || return 1
+    jq -e '.settings.udp == true and .settings.ip == "203.0.113.10"' <<< "$inbound" >/dev/null
+)
+check 'SOCKS template enables udp with reachable address when requested' socks_template_udp_probe
+
+# 分享链接必须能被本仓库导入端原样解析, 且凭据/名称经百分号编码后无损。
+socks_share_link_roundtrip_probe() (
+    local user="xd%user" pass="p@ss:word" name="SOCKS 测试" link out
+    link="socks5://$(_url_encode "$user"):$(_url_encode "$pass")@203.0.113.10:10808#$(_url_encode "$name")"
+    out=$(python3 "$ROOT/support/outbound_link.py" --batch "$link") || return 1
+    jq -e --arg user "$user" --arg pass "$pass" --arg name "$name" '
+        (.links | length) == 1
+        and .links[0].tag == $name
+        and .links[0].protocol == "socks"
+        and .links[0].outbound.settings.user == $user
+        and .links[0].outbound.settings.pass == $pass
+    ' <<< "$out" >/dev/null
+)
+check 'SOCKS share link round-trips through outbound importer' socks_share_link_roundtrip_probe
+
+# 改端口时链接必须换到新端口并保留原凭据与名称。
+socks_port_rebuild_probe() (
+    local dir="$TMP/socks-port" orig newlink
+    NODES_DIR="$dir/nodes"
+    mkdir -p "$NODES_DIR" || return 1
+    orig=$(jq -n '{tag:"xd-socks-10808",name:"SOCKS-10808",protocol:"socks",
+        port:10808,listen:"127.0.0.1",link_addr:"127.0.0.1",
+        username:"xduser",password:"secret",udp:false,
+        share_link:"socks5://xduser:secret@127.0.0.1:10808#SOCKS-10808"}')
+    printf '%s' "$orig" > "$NODES_DIR/xd-socks-10808.json" || return 1
+    newlink=$(_port_txn_build_newmeta "$NODES_DIR/xd-socks-10808.json" "$orig" 10808 10809 \
+        | jq -r '.share_link') || return 1
+    eq "$newlink" "socks5://xduser:secret@127.0.0.1:10809#SOCKS-10809"
+)
+check 'SOCKS port change rebuilds share link with new port' socks_port_rebuild_probe
+
 metadata_unlink_failure_probe() (
     local d="$TMP/metadata-unlink-failure" tag=meta-fail
     mkdir -p "$d/nodes" || return 1
